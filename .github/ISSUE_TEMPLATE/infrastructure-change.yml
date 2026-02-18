@@ -1,0 +1,43 @@
+name: Infrastructure Change
+description: Request a platform, pipeline, or IaC change
+labels: ["infrastructure"]
+body:
+  - type: dropdown
+    id: change-type
+    attributes:
+      label: Change Category
+      options:
+        - Pipeline / CI-CD
+        - Terraform / IaC
+        - Container Registry / Artifacts
+        - Monitoring / Observability
+        - Security / Compliance
+        - Repository / Branch Policy
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What needs to change and why?
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact Assessment
+      description: What systems, repos, or teams are affected?
+    validations:
+      required: true
+  - type: dropdown
+    id: urgency
+    attributes:
+      label: Urgency
+      options:
+        - Low — next sprint
+        - Medium — this sprint
+        - High — blocking work
+        - Critical — production incident
+    validations:
+      required: true
