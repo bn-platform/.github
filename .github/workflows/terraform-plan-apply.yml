@@ -1,0 +1,35 @@
+name: Terraform Plan and Apply
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Path to Terraform environment directory"
+        required: true
+        type: string
+      terraform-version:
+        description: "Terraform CLI version"
+        required: false
+        type: string
+        default: "1.7.0"
+
+# TODO: Implement in WS-2
+# Steps will include: fmt check, init, validate, plan on PR, apply on merge with approval gate
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+      - name: Format Check
+        run: terraform fmt -check -recursive
+      - name: Init
+        run: terraform init -backend=false
+      - name: Validate
+        run: terraform validate

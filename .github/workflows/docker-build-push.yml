@@ -1,0 +1,31 @@
+name: Docker Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Container image name (without registry prefix)"
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to Dockerfile"
+        required: false
+        type: string
+        default: "./Dockerfile"
+      context:
+        description: "Docker build context"
+        required: false
+        type: string
+        default: "."
+
+# TODO: Implement in WS-2
+# Steps will include: build, Trivy scan, push to GHCR on main only
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t ${{ inputs.image-name }}:${{ github.sha }} -f ${{ inputs.dockerfile }} ${{ inputs.context }}
+      - name: Placeholder — Trivy scan and GHCR push
+        run: echo "Trivy scan and GHCR push will be implemented in WS-2"
