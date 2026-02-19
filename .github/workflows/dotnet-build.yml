@@ -1,4 +1,21 @@
-name: .NET Build
+# =============================================================================
+# Reusable Workflow: .NET Build → Test → Publish
+# Owner: Platform Engineering (bn-platform)
+# Consumers call this workflow — they never configure build infrastructure.
+# =============================================================================
+# Usage (caller workflow in any repo):
+#
+#   jobs:
+#     build:
+#       uses: bn-platform/.github/.github/workflows/dotnet-build.yml@main
+#       with:
+#         dotnet-version: "8.0.x"
+#         project-path: "src/MyApp"
+#       secrets: inherit
+#
+# =============================================================================
+
+name: ".NET Build & Publish"
 
 on:
   workflow_call:
@@ -9,25 +26,93 @@ on:
         type: string
         default: "8.0.x"
       project-path:
-        description: "Path to solution or project file"
+        description: "Path to the project or solution file (relative to repo root)"
         required: false
         type: string
         default: "."
+      test-project-path:
+        description: "Path to the test project (relative to repo root). Set to empty string to skip tests."
+        required: false
+        type: string
+        default: ""
+      artifact-name:
+        description: "Name for the build artifact"
+        required: false
+        type: string
+        default: "dotnet-build"
+      publish-package:
+        description: "Publish NuGet package to GitHub Packages on merge to main"
+        required: false
+        type: boolean
+        default: false
+      configuration:
+        description: "Build configuration (Debug or Release)"
+        required: false
+        type: string
+        default: "Release"
 
-# TODO: Implement in WS-2
-# Steps will include: restore, build, test, publish NuGet package
 jobs:
   build:
+    name: Build & Test
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup .NET
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ inputs.dotnet-version }}
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
-      - name: Restore
+
+      - name: Restore dependencies
         run: dotnet restore ${{ inputs.project-path }}
+
       - name: Build
-        run: dotnet build ${{ inputs.project-path }} --no-restore
+        run: dotnet build ${{ inputs.project-path }} --configuration ${{ inputs.configuration }} --no-restore
+
       - name: Test
-        run: dotnet test ${{ inputs.project-path }} --no-build --verbosity normal
+        if: inputs.test-project-path != ''
+        run: dotnet test ${{ inputs.test-project-path }} --configuration ${{ inputs.configuration }} --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        if: inputs.test-project-path != '' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: "**/test-results.trx"
+          retention-days: 14
+
+      - name: Publish build output
+        run: dotnet publish ${{ inputs.project-path }} --configuration ${{ inputs.configuration }} --no-build --output ./publish
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./publish
+          retention-days: 30
+
+  package:
+    name: Publish NuGet Package
+    needs: build
+    if: inputs.publish-package && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ inputs.dotnet-version }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Pack
+        run: dotnet pack ${{ inputs.project-path }} --configuration ${{ inputs.configuration }} --output ./nupkg
+
+      - name: Push to GitHub Packages
+        run: dotnet nuget push ./nupkg/*.nupkg --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate

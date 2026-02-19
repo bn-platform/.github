@@ -1,35 +1,228 @@
-name: Terraform Plan and Apply
+# =============================================================================
+# Reusable Workflow: Terraform Fmt → Validate → Plan → Apply
+# Owner: Platform Engineering (bn-platform)
+# Consumers call this workflow — infrastructure provisioning is platform-governed.
+# =============================================================================
+# Usage (caller workflow in any repo):
+#
+#   jobs:
+#     infra:
+#       uses: bn-platform/.github/.github/workflows/terraform-plan-apply.yml@main
+#       with:
+#         working-directory: "environments/dev"
+#         arm-client-id: ${{ vars.ARM_CLIENT_ID }}
+#         arm-subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+#         arm-tenant-id: ${{ vars.ARM_TENANT_ID }}
+#       secrets: inherit
+#
+# =============================================================================
+
+name: "Terraform Plan & Apply"
 
 on:
   workflow_call:
     inputs:
-      working-directory:
-        description: "Path to Terraform environment directory"
-        required: true
-        type: string
       terraform-version:
         description: "Terraform CLI version"
         required: false
         type: string
-        default: "1.7.0"
+        default: "1.7.x"
+      working-directory:
+        description: "Directory containing Terraform configuration"
+        required: false
+        type: string
+        default: "."
+      backend-config:
+        description: "Additional backend config arguments (e.g., 'key=myapp.tfstate')"
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "GitHub Environment for apply job (enables protection rules)"
+        required: false
+        type: string
+        default: "production"
+      arm-client-id:
+        description: "Azure AD application (client) ID for OIDC auth"
+        required: false
+        type: string
+        default: ""
+      arm-subscription-id:
+        description: "Azure subscription ID"
+        required: false
+        type: string
+        default: ""
+      arm-tenant-id:
+        description: "Azure AD tenant ID"
+        required: false
+        type: string
+        default: ""
+      plan-only:
+        description: "Run plan only, skip apply (useful for read-only demos)"
+        required: false
+        type: boolean
+        default: false
 
-# TODO: Implement in WS-2
-# Steps will include: fmt check, init, validate, plan on PR, apply on merge with approval gate
 jobs:
-  plan:
+  # ─────────────────────────────────────────────────────────────────────────
+  # VALIDATE: Runs on every push and PR — fast feedback
+  # ─────────────────────────────────────────────────────────────────────────
+  validate:
+    name: Format & Validate
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Terraform
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ inputs.terraform-version }}
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ inputs.terraform-version }}
-      - name: Format Check
-        run: terraform fmt -check -recursive
-      - name: Init
-        run: terraform init -backend=false
-      - name: Validate
-        run: terraform validate
+
+      - name: Terraform fmt check
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Terraform init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend-config }}" ]; then
+            BACKEND_ARGS="-backend-config=${{ inputs.backend-config }}"
+          fi
+          terraform init -input=false $BACKEND_ARGS
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ARM_CLIENT_ID: ${{ inputs.arm-client-id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.arm-subscription-id }}
+          ARM_TENANT_ID: ${{ inputs.arm-tenant-id }}
+          ARM_USE_OIDC: true
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+        working-directory: ${{ inputs.working-directory }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # PLAN: Runs on PRs — shows what would change
+  # ─────────────────────────────────────────────────────────────────────────
+  plan:
+    name: Terraform Plan
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ inputs.terraform-version }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Terraform init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend-config }}" ]; then
+            BACKEND_ARGS="-backend-config=${{ inputs.backend-config }}"
+          fi
+          terraform init -input=false $BACKEND_ARGS
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ARM_CLIENT_ID: ${{ inputs.arm-client-id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.arm-subscription-id }}
+          ARM_TENANT_ID: ${{ inputs.arm-tenant-id }}
+          ARM_USE_OIDC: true
+
+      - name: Terraform plan
+        id: plan
+        run: terraform plan -no-color -input=false -out=tfplan 2>&1 | tee plan-output.txt
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ARM_CLIENT_ID: ${{ inputs.arm-client-id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.arm-subscription-id }}
+          ARM_TENANT_ID: ${{ inputs.arm-tenant-id }}
+          ARM_USE_OIDC: true
+
+      - name: Post plan to PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ inputs.working-directory }}/plan-output.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n\n... (truncated)' : plan;
+            const body = `### Terraform Plan — \`${{ inputs.working-directory }}\`
+            
+            <details><summary>Show plan output</summary>
+
+            \`\`\`
+            ${truncated}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: ${{ inputs.working-directory }}/tfplan
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # APPLY: Runs on merge to main — provisions infrastructure
+  # ─────────────────────────────────────────────────────────────────────────
+  apply:
+    name: Terraform Apply
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !inputs.plan-only
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ inputs.terraform-version }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Terraform init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend-config }}" ]; then
+            BACKEND_ARGS="-backend-config=${{ inputs.backend-config }}"
+          fi
+          terraform init -input=false $BACKEND_ARGS
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ARM_CLIENT_ID: ${{ inputs.arm-client-id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.arm-subscription-id }}
+          ARM_TENANT_ID: ${{ inputs.arm-tenant-id }}
+          ARM_USE_OIDC: true
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve -input=false
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ARM_CLIENT_ID: ${{ inputs.arm-client-id }}
+          ARM_SUBSCRIPTION_ID: ${{ inputs.arm-subscription-id }}
+          ARM_TENANT_ID: ${{ inputs.arm-tenant-id }}
+          ARM_USE_OIDC: true

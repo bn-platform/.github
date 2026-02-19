@@ -1,4 +1,20 @@
-name: Docker Build and Push
+# =============================================================================
+# Reusable Workflow: Docker Build → Trivy Scan → Push to GHCR
+# Owner: Platform Engineering (bn-platform)
+# Consumers call this workflow — security scanning is platform-provided.
+# =============================================================================
+# Usage (caller workflow in any repo):
+#
+#   jobs:
+#     build:
+#       uses: bn-platform/.github/.github/workflows/docker-build-push.yml@main
+#       with:
+#         image-name: "my-service"
+#       secrets: inherit
+#
+# =============================================================================
+
+name: "Docker Build, Scan & Push"
 
 on:
   workflow_call:
@@ -7,25 +23,117 @@ on:
         description: "Container image name (without registry prefix)"
         required: true
         type: string
-      dockerfile:
-        description: "Path to Dockerfile"
+      dockerfile-path:
+        description: "Path to Dockerfile (relative to repo root)"
         required: false
         type: string
-        default: "./Dockerfile"
+        default: "Dockerfile"
       context:
-        description: "Docker build context"
+        description: "Docker build context directory"
         required: false
         type: string
         default: "."
+      registry:
+        description: "Container registry (default: ghcr.io)"
+        required: false
+        type: string
+        default: "ghcr.io"
+      trivy-severity:
+        description: "Trivy severity threshold (CRITICAL, HIGH, MEDIUM, LOW)"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      trivy-exit-code:
+        description: "Exit code when vulnerabilities found (1 = fail the build, 0 = warn only)"
+        required: false
+        type: string
+        default: "1"
+      push-image:
+        description: "Push image to registry (false on PRs by default — see job condition)"
+        required: false
+        type: boolean
+        default: true
 
-# TODO: Implement in WS-2
-# Steps will include: build, Trivy scan, push to GHCR on main only
 jobs:
-  build:
+  build-and-scan:
+    name: Build & Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.build-push.outputs.digest }}
+      scan-passed: ${{ steps.trivy.outcome == 'success' }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ github.repository_owner }}/${{ inputs.image-name }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build image locally first for scanning (do not push yet)
       - name: Build image
-        run: docker build -t ${{ inputs.image-name }}:${{ github.sha }} -f ${{ inputs.dockerfile }} ${{ inputs.context }}
-      - name: Placeholder — Trivy scan and GHCR push
-        run: echo "Trivy scan and GHCR push will be implemented in WS-2"
+        uses: docker/build-push-action@v6
+        id: build-local
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile-path }}
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy vulnerability scan
+        id: trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ inputs.registry }}/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.meta.outputs.version }}
+          format: "table"
+          exit-code: ${{ inputs.trivy-exit-code }}
+          severity: ${{ inputs.trivy-severity }}
+          output: "trivy-results.txt"
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-results
+          path: trivy-results.txt
+          retention-days: 30
+
+      # Only push if scan passed AND we're on main (not a PR)
+      - name: Push image to GHCR
+        if: inputs.push-image && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        id: build-push
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile-path }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
